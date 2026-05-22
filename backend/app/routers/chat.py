@@ -12,6 +12,7 @@ flaky mobile network don't double-create workflows.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import uuid
 from typing import Literal
@@ -138,5 +139,34 @@ async def post_chat(body: ChatRequest) -> ChatResponse:
 
 @router.get("/stream/{session_id}")
 async def stream_events(session_id: str):
-    """SSE stream of AgentEvents – implemented in task 4.2."""
-    return {"detail": "not implemented yet"}
+    """SSE stream of `AgentEvent`s for the given session.
+
+    Behavior:
+        * Subscribes to the in-memory broker for this session_id.
+        * Each event is encoded as JSON and emitted as an SSE `data:`
+          line. The SSE `event:` field carries the `type` discriminator
+          so the frontend can dispatch via `EventSource.addEventListener`
+          if it prefers, or read `parsed.type` from the JSON body.
+        * sse_starlette emits a `: ping` comment every 15 seconds (Req
+          5.1, 1.2) so corporate proxies and mobile carriers don't kill
+          the idle connection.
+        * On client disconnect the broker subscription is cleaned up via
+          its `finally` block; the workflow itself keeps running in the
+          background and the client can rejoin via this endpoint plus
+          GET /api/workflows/{id} for the snapshot.
+    """
+    from sse_starlette.sse import EventSourceResponse
+
+    from ..core.event_broker import broker
+    from ..core.event_serializer import event_to_dict
+
+    async def event_generator():
+        async for event in broker.subscribe(session_id):
+            yield {
+                "event": event.type,
+                "data": json.dumps(event_to_dict(event)),
+            }
+
+    # ping=15 → emit `: ping` comment every 15s; sep="\n" is required
+    # by the SSE spec to separate fields within an event.
+    return EventSourceResponse(event_generator(), ping=15, sep="\n")
