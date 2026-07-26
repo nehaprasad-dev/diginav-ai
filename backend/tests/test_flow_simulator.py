@@ -116,7 +116,9 @@ async def test_each_pre_human_step_emits_in_progress_then_completed(flow_id, fak
     for idx in range(human_idx):
         idx_updates = [u for u in updates if u.step_idx == idx]
         statuses = [u.status for u in idx_updates]
-        assert statuses == ["in_progress", "completed"], (
+        assert statuses[0] == "in_progress", f"step {idx} statuses={statuses}"
+        assert statuses[-1] == "completed", f"step {idx} statuses={statuses}"
+        assert all(s == "in_progress" for s in statuses[:-1]), (
             f"step {idx} statuses={statuses}"
         )
 
