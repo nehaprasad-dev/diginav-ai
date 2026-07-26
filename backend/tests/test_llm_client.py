@@ -123,8 +123,8 @@ class TestAllRetriesFailFallback:
         assert "name_reserve" in SCRIPTED_FALLBACK
         assert "cin_gen" in SCRIPTED_FALLBACK
         # GST
-        assert "gst_eligibility" in SCRIPTED_FALLBACK
-        assert "gst_certificate" in SCRIPTED_FALLBACK
+        assert "gst_fetch_sales" in SCRIPTED_FALLBACK
+        assert "gst_submit_arn" in SCRIPTED_FALLBACK
         # SE License
-        assert "se_eligibility" in SCRIPTED_FALLBACK
-        assert "se_certificate" in SCRIPTED_FALLBACK
+        assert "se_detect_state" in SCRIPTED_FALLBACK
+        assert "se_issue_license" in SCRIPTED_FALLBACK
