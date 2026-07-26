@@ -216,17 +216,30 @@ class FlowSimulator:
             self._approved = None
             return
 
-        # Normal step: stream narration concurrently with simulated work
+        # Normal step: stream narration, then simulate work with live sub-status.
         message_id = str(uuid.uuid4())
         async for token in self._llm.stream_narration(
             step.narration_prompt, step_id=step.id
         ):
             yield TokenEvent(text=token, message_id=message_id)
 
-        # Sleep a randomized duration in [lo, hi] (Req 3.4: 3-15s real time)
         lo, hi = step.duration_range
-        if hi > 0:
-            await asyncio.sleep(random.uniform(lo, hi))
+        duration = random.uniform(lo, hi) if hi > 0 else 0.0
+        remaining = duration
+        tick = 0
+        while remaining > 0:
+            chunk = min(2.0, remaining)
+            await asyncio.sleep(chunk)
+            remaining -= chunk
+            if remaining <= 0:
+                break
+            tick += 1
+            yield StepUpdateEvent(
+                workflow_id=self.workflow_id,
+                step_idx=idx,
+                status="in_progress",
+                sub_status=_sub_status_for(step, tick),
+            )
 
         yield StepUpdateEvent(
             workflow_id=self.workflow_id,
@@ -257,3 +270,14 @@ class FlowSimulator:
 def _to_snake(label: str) -> str:
     """Convert a human label like 'SE License' to a JSON key 'se_license'."""
     return "_".join(label.lower().split())
+
+
+def _sub_status_for(step: Step, tick: int) -> str:
+    """Rotate a short live sub-status while a step is in progress."""
+    phrases = (
+        f"Working on {step.title.lower()}…",
+        f"Validating outputs for {step.id}…",
+        f"Cross-checking records for {step.title.lower()}…",
+        f"Almost done with {step.title.lower()}…",
+    )
+    return phrases[(tick - 1) % len(phrases)]
