@@ -20,25 +20,21 @@ from typing import Literal
 from fastapi import APIRouter, status
 from pydantic import BaseModel, Field
 
+from ..core.event_broker import broker
+from ..core.events import IntentDetectedEvent, TokenEvent
 from ..core.intent_classifier import IntentClassifier
+from ..core.llm_client import LLMClient
 from ..core.runner import runner
+from ..store.event_logger import event_logger
 from ..store.workflow_store import workflow_store
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["chat"])
 
-# Single shared classifier; safe because it's stateless between calls.
 _classifier = IntentClassifier()
+_llm = LLMClient()
 
-# Set of regulatory flow IDs that should kick off a workflow. Anything
-# else (general_chat) is answered by a one-shot LLM token stream and
-# does not create a workflow row.
 _FLOW_INTENTS: set[str] = {"incorporation", "gst_filing", "se_license"}
-
-
-# --------------------------------------------------------------------- #
-# Schemas                                                                #
-# --------------------------------------------------------------------- #
 
 
 class ChatRequest(BaseModel):
@@ -70,9 +66,21 @@ class ChatResponse(BaseModel):
     model_config = {"populate_by_name": True}
 
 
-# --------------------------------------------------------------------- #
-# Endpoints                                                              #
-# --------------------------------------------------------------------- #
+async def _stream_general_chat(session_id: str, user_message: str) -> None:
+    """Publish a one-shot assistant reply for non-workflow questions."""
+    assistant_message_id = str(uuid.uuid4())
+    prompt = (
+        "Answer this founder question about Indian business compliance "
+        f"in 2-4 short sentences:\n\n{user_message}"
+    )
+    try:
+        async for token in _llm.stream_narration(prompt, step_id="general_chat"):
+            await broker.publish(
+                session_id,
+                TokenEvent(text=token, message_id=assistant_message_id),
+            )
+    except Exception:  # noqa: BLE001
+        logger.exception("General chat stream failed for session %s", session_id)
 
 
 @router.post(
@@ -81,17 +89,7 @@ class ChatResponse(BaseModel):
     status_code=status.HTTP_202_ACCEPTED,
 )
 async def post_chat(body: ChatRequest) -> ChatResponse:
-    """Accept a user message and (optionally) start a workflow.
-
-    Flow:
-        1. Ensure the session row exists.
-        2. Persist the user message; bail out idempotently on duplicate.
-        3. Classify intent.
-        4. If a regulatory flow is detected, spawn the runner as a
-           background task and return the workflow_id immediately.
-        5. Otherwise, return a stream URL and let the caller pull a
-           general-chat token response (handled by GET /api/stream).
-    """
+    """Accept a user message and (optionally) start a workflow."""
     session_uuid = await workflow_store.ensure_session(body.session_id)
     msg_uuid = uuid.UUID(body.message_id)
 
@@ -102,10 +100,11 @@ async def post_chat(body: ChatRequest) -> ChatResponse:
         content=body.message,
     )
     if not inserted:
-        # Same messageId seen before — this is a retry. Don't classify
-        # again or start a duplicate workflow; just hand back the stream
-        # URL so the client can re-attach.
-        logger.info("Duplicate message_id %s on session %s", body.message_id, body.session_id)
+        logger.info(
+            "Duplicate message_id %s on session %s",
+            body.message_id,
+            body.session_id,
+        )
         return ChatResponse(
             stream_url=f"/api/stream/{body.session_id}",
             workflow_id=None,
@@ -115,19 +114,41 @@ async def post_chat(body: ChatRequest) -> ChatResponse:
 
     intent, confidence = await _classifier.classify(body.message)
 
+    try:
+        await event_logger.log(
+            body.session_id,
+            "message_sent",
+            flow_id=intent if intent in _FLOW_INTENTS else None,
+            prompt=body.message,
+            meta={"confidence": confidence},
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("Failed to log message_sent analytics event")
+
     workflow_id: str | None = None
     if intent in _FLOW_INTENTS:
-        # Synchronously create the workflow row + register simulator,
-        # then schedule the long-running drain as a background task so
-        # POST /api/chat returns in tens of milliseconds even though
-        # the workflow itself runs for 30-90 seconds.
+        await broker.publish(
+            body.session_id,
+            IntentDetectedEvent(flow=intent, confidence=confidence),
+        )
         sim, workflow_id = await runner.prepare(
             session_id=body.session_id,
             flow_id=intent,
         )
+        try:
+            await event_logger.log(
+                body.session_id,
+                "workflow_started",
+                flow_id=intent,
+                meta={"workflowId": workflow_id},
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to log workflow_started analytics event")
         asyncio.create_task(
             runner.drain_start(sim, body.session_id, body.message)
         )
+    else:
+        asyncio.create_task(_stream_general_chat(body.session_id, body.message))
 
     return ChatResponse(
         stream_url=f"/api/stream/{body.session_id}",
@@ -139,25 +160,9 @@ async def post_chat(body: ChatRequest) -> ChatResponse:
 
 @router.get("/stream/{session_id}")
 async def stream_events(session_id: str):
-    """SSE stream of `AgentEvent`s for the given session.
-
-    Behavior:
-        * Subscribes to the in-memory broker for this session_id.
-        * Each event is encoded as JSON and emitted as an SSE `data:`
-          line. The SSE `event:` field carries the `type` discriminator
-          so the frontend can dispatch via `EventSource.addEventListener`
-          if it prefers, or read `parsed.type` from the JSON body.
-        * sse_starlette emits a `: ping` comment every 15 seconds (Req
-          5.1, 1.2) so corporate proxies and mobile carriers don't kill
-          the idle connection.
-        * On client disconnect the broker subscription is cleaned up via
-          its `finally` block; the workflow itself keeps running in the
-          background and the client can rejoin via this endpoint plus
-          GET /api/workflows/{id} for the snapshot.
-    """
+    """SSE stream of `AgentEvent`s for the given session."""
     from sse_starlette.sse import EventSourceResponse
 
-    from ..core.event_broker import broker
     from ..core.event_serializer import event_to_dict
 
     async def event_generator():
@@ -167,6 +172,4 @@ async def stream_events(session_id: str):
                 "data": json.dumps(event_to_dict(event)),
             }
 
-    # ping=15 → emit `: ping` comment every 15s; sep="\n" is required
-    # by the SSE spec to separate fields within an event.
     return EventSourceResponse(event_generator(), ping=15, sep="\n")
