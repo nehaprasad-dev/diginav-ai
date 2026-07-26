@@ -73,50 +73,54 @@ SCRIPTED_FALLBACK: dict[str, str] = {
         "Your company has been successfully incorporated!"
     ),
     # GST Filing flow
-    "gst_eligibility": (
-        "Checking GST registration eligibility based on turnover threshold... "
-        "Your business exceeds the ₹40L threshold and requires GST registration."
+    "gst_fetch_sales": (
+        "Pulling sales invoices and credit notes for the filing period... "
+        "Sales data has been loaded and is ready for tax computation."
     ),
-    "gst_docs": (
-        "Gathering required documents: PAN, Aadhaar, business address proof, "
-        "bank statement... All documents verified."
+    "gst_compute_liability": (
+        "Calculating output tax, available ITC, and net GST liability... "
+        "Liability figures are ready for reconciliation."
     ),
-    "gst_application": (
-        "Submitting GST REG-01 application on the GST portal... "
-        "Application reference number generated."
+    "gst_reconcile_2b": (
+        "Matching purchase invoices against GSTR-2B from the GSTN portal... "
+        "Mismatches have been flagged for review."
     ),
-    "gst_verification": (
-        "Application is under verification by the tax officer... "
-        "No discrepancies found in the submitted documents."
+    "gst_generate_3b": (
+        "Generating the GSTR-3B return from reconciled figures... "
+        "Draft return is ready for your approval."
     ),
     "gst_human_review": (
-        "Your GST application details are ready for review. "
-        "Please confirm the business details before final submission."
+        "Your GSTR-3B draft is ready for review. "
+        "Please confirm the liability figures before final submission."
     ),
-    "gst_certificate": (
-        "GST registration certificate issued. "
-        "Your GSTIN is now active and you can begin filing returns."
+    "gst_submit_arn": (
+        "Submitting GSTR-3B to the GST portal... "
+        "Return filed successfully. Acknowledgment Reference Number generated."
     ),
     # Shop & Establishment License flow
-    "se_eligibility": (
-        "Verifying eligibility under the state's Shops & Establishments Act... "
-        "Your business type qualifies for registration."
+    "se_detect_state": (
+        "Identifying the applicable state Shops & Establishments Act... "
+        "State rules have been selected for this business."
     ),
-    "se_docs": (
-        "Collecting required documents: identity proof, address proof, "
-        "rent agreement, photos... All documents in order."
+    "se_fetch_form": (
+        "Retrieving the latest state-specific registration form... "
+        "Form template loaded and ready to pre-fill."
     ),
-    "se_application": (
-        "Submitting application to the local municipal authority... "
-        "Application accepted and acknowledgment number issued."
+    "se_prefill": (
+        "Pre-filling the application from the saved business profile... "
+        "Name, address, and employee count have been populated."
     ),
     "se_human_review": (
         "Application details are ready for your review. "
         "Please verify the establishment details before final submission."
     ),
-    "se_certificate": (
-        "Shop & Establishment license has been issued. "
+    "se_issue_license": (
+        "Issuing the Shop & Establishment license... "
         "Your business is now compliant with local labor regulations."
+    ),
+    "general_chat": (
+        "I can help with company incorporation, GST filing, and Shops & "
+        "Establishment licenses. Tell me what you need and I will guide you."
     ),
     # Generic fallback for unknown steps
     "_default": (
