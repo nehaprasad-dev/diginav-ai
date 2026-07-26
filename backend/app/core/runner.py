@@ -40,6 +40,7 @@ from .events import (
     WorkflowStartedEvent,
 )
 from .flow_simulator import FlowSimulator
+from ..store.event_logger import EventLogger, event_logger as default_logger
 from ..store.workflow_store import WorkflowStore, workflow_store as default_store
 
 logger = logging.getLogger(__name__)
@@ -59,16 +60,28 @@ class WorkflowRunner:
         self,
         store: WorkflowStore | None = None,
         event_broker: EventBroker | None = None,
+        logger_service: EventLogger | None = None,
     ):
         self._store = store or default_store
         self._broker = event_broker or default_broker
-        # session_id -> FlowSimulator, so resume() can look up the live
-        # instance keeping the workflow's in-memory state.
+        self._logger = logger_service or default_logger
+        # workflow_id -> FlowSimulator (live in-memory state for resume)
         self._simulators: dict[str, FlowSimulator] = {}
+        # "workflow_id:approval_id" keys already handled (idempotent resume)
+        self._processed_approvals: set[str] = set()
 
     # ------------------------------------------------------------------ #
     # Public entry points                                                 #
     # ------------------------------------------------------------------ #
+
+    def has_simulator(self, workflow_id: str) -> bool:
+        return workflow_id in self._simulators
+
+    def was_approval_processed(self, workflow_id: str, approval_id: str) -> bool:
+        return f"{workflow_id}:{approval_id}" in self._processed_approvals
+
+    def mark_approval_processed(self, workflow_id: str, approval_id: str) -> None:
+        self._processed_approvals.add(f"{workflow_id}:{approval_id}")
 
     async def run(
         self,
@@ -83,7 +96,11 @@ class WorkflowRunner:
         instead so the request can return before the simulator finishes.
         """
         sim, wf_id = await self.prepare(session_id, flow_id)
-        await self._drive(session_id, sim.start(session_id, user_message))
+        await self._drive(
+            session_id,
+            sim.start(session_id, user_message),
+            workflow_id=wf_id,
+        )
         return wf_id
 
     async def prepare(
@@ -116,7 +133,11 @@ class WorkflowRunner:
 
     async def drain_start(self, sim: FlowSimulator, session_id: str, user_message: str) -> None:
         """Drain a fresh simulator's start() stream. Intended for create_task."""
-        await self._drive(session_id, sim.start(session_id, user_message))
+        await self._drive(
+            session_id,
+            sim.start(session_id, user_message),
+            workflow_id=sim.workflow_id,
+        )
 
     async def resume(
         self,
@@ -127,8 +148,6 @@ class WorkflowRunner:
         """Continue a paused workflow after a human approval decision."""
         sim = self._simulators.get(workflow_id)
         if sim is None:
-            # Not in memory (e.g. process restart in prod). Synthesize an
-            # error event so the frontend gets a clear signal.
             await self._broker.publish(
                 session_id,
                 ErrorEvent(
@@ -137,8 +156,40 @@ class WorkflowRunner:
                     recoverable=False,
                 ),
             )
+            await self._store.set_status(
+                workflow_id=uuid.UUID(workflow_id),
+                status="failed",
+            )
             return
-        await self._drive(session_id, sim.resume(workflow_id, approved))
+
+        if approved:
+            await self._store.set_status(
+                workflow_id=uuid.UUID(workflow_id),
+                status="running",
+            )
+            try:
+                await self._logger.log(
+                    session_id,
+                    "approval_granted",
+                    meta={"workflowId": workflow_id},
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("Failed to log approval_granted")
+        else:
+            try:
+                await self._logger.log(
+                    session_id,
+                    "approval_rejected",
+                    meta={"workflowId": workflow_id},
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("Failed to log approval_rejected")
+
+        await self._drive(
+            session_id,
+            sim.resume(workflow_id, approved),
+            workflow_id=workflow_id,
+        )
 
     # ------------------------------------------------------------------ #
     # Internals                                                           #
@@ -148,11 +199,16 @@ class WorkflowRunner:
         self,
         session_id: str,
         events: AsyncIterator[AgentEvent],
+        workflow_id: str | None = None,
     ) -> None:
         """Drain an event stream: persist, then publish, for each event."""
         try:
             async for event in events:
-                await self._persist(event)
+                await self._persist(
+                    event,
+                    session_id=session_id,
+                    workflow_id=workflow_id,
+                )
                 await self._broker.publish(session_id, event)
         except Exception as exc:  # noqa: BLE001
             logger.exception("Runner failed for session %s", session_id)
@@ -161,12 +217,22 @@ class WorkflowRunner:
                 correlation_id=str(uuid.uuid4()),
                 recoverable=False,
             )
+            if workflow_id:
+                await self._store.set_status(
+                    workflow_id=uuid.UUID(workflow_id),
+                    status="failed",
+                )
             await self._broker.publish(session_id, err)
 
-    async def _persist(self, event: AgentEvent) -> None:
+    async def _persist(
+        self,
+        event: AgentEvent,
+        *,
+        session_id: str,
+        workflow_id: str | None = None,
+    ) -> None:
         """Map an AgentEvent to the appropriate WorkflowStore call."""
         if isinstance(event, WorkflowStartedEvent):
-            # Initial row was already inserted in run(); nothing to do here.
             return
 
         if isinstance(event, StepUpdateEvent):
@@ -191,19 +257,41 @@ class WorkflowRunner:
                 status="completed",
                 output=dict(event.output),
             )
+            sim = self._simulators.get(event.workflow_id)
+            try:
+                await self._logger.log(
+                    session_id,
+                    "workflow_completed",
+                    flow_id=sim.flow_id if sim else None,
+                    meta={"workflowId": event.workflow_id},
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("Failed to log workflow_completed")
             return
 
         if isinstance(event, ErrorEvent):
-            # Errors don't always carry a workflow_id (broker-level
-            # synthetic errors don't). Persist failure only when we have
-            # a live simulator to map back to.
+            target = workflow_id
+            if target and not event.recoverable:
+                await self._store.set_status(
+                    workflow_id=uuid.UUID(target),
+                    status="failed",
+                )
+                sim = self._simulators.get(target)
+                try:
+                    await self._logger.log(
+                        session_id,
+                        "workflow_failed",
+                        flow_id=sim.flow_id if sim else None,
+                        meta={
+                            "workflowId": target,
+                            "message": event.message,
+                        },
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.exception("Failed to log workflow_failed")
             return
 
         if isinstance(event, TokenEvent):
-            # Tokens are ephemeral; they live on the SSE channel only.
-            # Persisting per-token would 100x our write rate for no gain
-            # since the assistant message can be reconstructed from the
-            # final completed event or a single end-of-stream insert.
             return
 
 
