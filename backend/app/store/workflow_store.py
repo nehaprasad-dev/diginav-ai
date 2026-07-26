@@ -19,7 +19,6 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from ..models.chat_message import ChatMessage
@@ -164,8 +163,27 @@ class WorkflowStore:
             await db.commit()
 
     async def get_workflow(self, workflow_id: uuid.UUID) -> Workflow | None:
+        """Load a workflow and detach field values before the session closes."""
         async with async_session_factory() as db:
-            return await db.get(Workflow, workflow_id)
+            wf = await db.get(Workflow, workflow_id)
+            if wf is None:
+                return None
+            # Touch attributes while the session is open so callers can
+            # safely read them after this method returns.
+            _ = (
+                wf.id,
+                wf.session_id,
+                wf.flow_id,
+                wf.status,
+                wf.current_step_idx,
+                wf.steps,
+                wf.output,
+                wf.started_at,
+                wf.updated_at,
+                wf.completed_at,
+            )
+            db.expunge(wf)
+            return wf
 
 
 # Module-level singleton; routers import this.
