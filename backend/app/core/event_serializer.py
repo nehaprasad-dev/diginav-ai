@@ -21,6 +21,7 @@ from .events import (
     AgentEvent,
     AwaitingHumanEvent,
     ErrorEvent,
+    IntentDetectedEvent,
     StepUpdateEvent,
     TokenEvent,
     WorkflowCompletedEvent,
@@ -32,6 +33,7 @@ from .events import (
 # any future field rename has to touch this file.
 _FIELD_RENAMES: dict[type, dict[str, str]] = {
     TokenEvent: {"message_id": "messageId"},
+    IntentDetectedEvent: {},
     WorkflowStartedEvent: {"workflow_id": "workflowId"},
     StepUpdateEvent: {
         "workflow_id": "workflowId",
